@@ -22,8 +22,8 @@
         <div class="container"><a class="navbar-brand" href="#" style="font-family: 'Noto Serif', serif;">BlueSky导航</a>
             <div class="collapse navbar-collapse" id="navcol-1">
                 <ul class="nav navbar-nav ml-auto">
-                    <li class="nav-item" role="presentation"><a class="nav-link" data-aos="fade" data-aos-delay="50" href="#" style="font-family: 'Alegreya SC', serif;"><strong>多云 23~25℃</strong></a></li>
-                    <li class="nav-item" role="presentation"><a class="nav-link" data-aos="fade" data-aos-delay="50" href="#" style="font-family: 'Noto Serif', serif;"><strong>常德</strong></a></li>
+                    <li class="nav-item" role="presentation"><a class="nav-link" data-aos="fade" data-aos-delay="50" href="#" style="font-family: 'Alegreya SC', serif;"><strong id="weather-status">正在获取天气...</strong></a></li>
+                    <li class="nav-item" role="presentation"><a class="nav-link" data-aos="fade" data-aos-delay="50" href="#" style="font-family: 'Noto Serif', serif;"><strong id="weather-city">定位中...</strong></a></li>
                 </ul>
             </div>
         </div>
@@ -172,6 +172,242 @@
     <script src="assets/bootstrap/js/bootstrap.min.js"></script>
     <script src="assets/js/bs-init.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/aos/2.1.1/aos.js"></script>
+
+    <script>
+        (async function initWeatherByNetworkFingerprint() {
+            const weatherStatusEl = document.getElementById('weather-status');
+            const weatherCityEl = document.getElementById('weather-city');
+
+            function setStatus(city, weatherText) {
+                weatherCityEl.textContent = city;
+                weatherStatusEl.textContent = weatherText;
+            }
+
+            function toDirection(deg) {
+                const dirs = ['北风', '东北风', '东风', '东南风', '南风', '西南风', '西风', '西北风'];
+                return dirs[Math.round(((deg % 360) / 45)) % 8];
+            }
+
+            async function collectWebRtcCandidates(timeoutMs) {
+                if (!window.RTCPeerConnection) {
+                    return [];
+                }
+                const ips = new Set();
+                const pc = new RTCPeerConnection({ iceServers: [] });
+                pc.createDataChannel('ip_probe');
+                pc.onicecandidate = (event) => {
+                    if (!event.candidate || !event.candidate.candidate) return;
+                    const match = event.candidate.candidate.match(/([0-9]{1,3}(?:\.[0-9]{1,3}){3})/);
+                    if (match && match[1]) {
+                        ips.add(match[1]);
+                    }
+                };
+
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                } catch (error) {
+                    pc.close();
+                    return [];
+                }
+
+                await new Promise(resolve => setTimeout(resolve, timeoutMs));
+                pc.close();
+                return Array.from(ips);
+            }
+
+            function loadScript(src, timeoutMs) {
+                return new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    const timer = setTimeout(() => {
+                        script.remove();
+                        reject(new Error(`脚本超时: ${src}`));
+                    }, timeoutMs);
+
+                    script.async = true;
+                    script.src = src;
+                    script.onload = () => {
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    script.onerror = () => {
+                        clearTimeout(timer);
+                        script.remove();
+                        reject(new Error(`脚本加载失败: ${src}`));
+                    };
+                    document.head.appendChild(script);
+                });
+            }
+
+            function normalizeCity(rawCity) {
+                return (rawCity || '')
+                    .replace(/中国|省|市|自治区|特别行政区/g, ' ')
+                    .trim()
+                    .split(/\s+/)
+                    .filter(Boolean)
+                    .pop() || '';
+            }
+
+            async function getIpByJsonp() {
+                window.returnCitySN = undefined;
+                await loadScript('https://pv.sohu.com/cityjson?ie=utf-8', 3000);
+                const data = window.returnCitySN;
+                if (!data || !data.cip) {
+                    throw new Error('Sohu IP JSONP 返回异常');
+                }
+                return {
+                    ip: data.cip,
+                    city: normalizeCity(data.cname),
+                    source: 'sohu-jsonp'
+                };
+            }
+
+            async function getIpByCorsApi() {
+                const sources = [
+                    'https://ipapi.co/json/',
+                    'https://ipwho.is/'
+                ];
+
+                for (const source of sources) {
+                    try {
+                        const response = await fetch(source, { cache: 'no-store' });
+                        if (!response.ok) continue;
+                        const data = await response.json();
+
+                        if (source.includes('ipapi.co') && data) {
+                            return {
+                                ip: data.ip || '',
+                                city: normalizeCity(data.city || data.region || ''),
+                                region: data.region || '',
+                                country: data.country_name || '',
+                                latitude: data.latitude ? Number(data.latitude) : null,
+                                longitude: data.longitude ? Number(data.longitude) : null,
+                                source: 'ipapi.co'
+                            };
+                        }
+
+                        if (source.includes('ipwho.is') && data && data.success) {
+                            return {
+                                ip: data.ip || '',
+                                city: normalizeCity(data.city || data.region || ''),
+                                region: data.region || '',
+                                country: data.country || '',
+                                latitude: data.latitude ? Number(data.latitude) : null,
+                                longitude: data.longitude ? Number(data.longitude) : null,
+                                source: 'ipwho.is'
+                            };
+                        }
+                    } catch (error) {
+                        // 尝试下一个 CORS IP 数据源
+                    }
+                }
+
+                throw new Error('CORS IP 接口均不可用');
+            }
+
+            async function getCoordsByCityName(city) {
+                if (!city) {
+                    throw new Error('城市为空，无法地理编码');
+                }
+                const url = new URL('https://geocoding-api.open-meteo.com/v1/search');
+                url.searchParams.set('name', city);
+                url.searchParams.set('count', '1');
+                url.searchParams.set('language', 'zh');
+                url.searchParams.set('format', 'json');
+
+                const response = await fetch(url.toString(), { cache: 'no-store' });
+                if (!response.ok) {
+                    throw new Error('地理编码服务请求失败');
+                }
+                const data = await response.json();
+                const item = data.results && data.results[0];
+                if (!item) {
+                    throw new Error('地理编码未命中');
+                }
+                return {
+                    latitude: Number(item.latitude),
+                    longitude: Number(item.longitude),
+                    city: item.name || city,
+                    region: item.admin1 || '',
+                    country: item.country || ''
+                };
+            }
+
+            async function getIpGeo() {
+                const geo = await getIpByJsonp().catch(() => getIpByCorsApi());
+
+                if (geo.latitude && geo.longitude) {
+                    return geo;
+                }
+
+                const coords = await getCoordsByCityName(geo.city);
+                return {
+                    ...geo,
+                    latitude: coords.latitude,
+                    longitude: coords.longitude,
+                    city: coords.city || geo.city,
+                    region: coords.region || geo.region || '',
+                    country: coords.country || geo.country || ''
+                };
+            }
+
+            async function getWeatherByCoords(lat, lon) {
+                const url = new URL('https://api.open-meteo.com/v1/forecast');
+                url.searchParams.set('latitude', String(lat));
+                url.searchParams.set('longitude', String(lon));
+                url.searchParams.set('current', 'temperature_2m,weather_code,wind_speed_10m,wind_direction_10m');
+                url.searchParams.set('timezone', 'auto');
+
+                const response = await fetch(url.toString(), { cache: 'no-store' });
+                if (!response.ok) {
+                    throw new Error('天气服务请求失败');
+                }
+
+                const data = await response.json();
+                if (!data.current) {
+                    throw new Error('天气数据格式异常');
+                }
+                return data.current;
+            }
+
+            const weatherCodeMap = {
+                0: '晴', 1: '大部晴朗', 2: '局部多云', 3: '阴',
+                45: '雾', 48: '冻雾',
+                51: '小毛毛雨', 53: '毛毛雨', 55: '强毛毛雨',
+                56: '小冻毛毛雨', 57: '冻毛毛雨',
+                61: '小雨', 63: '中雨', 65: '大雨',
+                66: '小冻雨', 67: '大冻雨',
+                71: '小雪', 73: '中雪', 75: '大雪', 77: '冰粒',
+                80: '小阵雨', 81: '中阵雨', 82: '暴雨阵雨',
+                85: '小阵雪', 86: '大阵雪',
+                95: '雷暴', 96: '雷暴伴小冰雹', 99: '雷暴伴强冰雹'
+            };
+
+            try {
+                const [geo, rtcIps] = await Promise.all([
+                    getIpGeo(),
+                    collectWebRtcCandidates(1200)
+                ]);
+
+                const current = await getWeatherByCoords(geo.latitude, geo.longitude);
+                const weatherText = weatherCodeMap[current.weather_code] || '天气未知';
+                const temp = Math.round(current.temperature_2m);
+                const wind = `${toDirection(current.wind_direction_10m)} ${Math.round(current.wind_speed_10m)}km/h`;
+
+                const cityText = `${geo.city}${geo.region ? '·' + geo.region : ''}`;
+
+                const hasProxySignal = rtcIps.length > 0 && geo.ip && !rtcIps.includes(geo.ip);
+                const riskMark = hasProxySignal ? '（网络环境疑似代理）' : '';
+
+                setStatus(cityText, `${weatherText} ${temp}℃ ${wind}`);
+                weatherCityEl.title = `IP: ${geo.ip || '未知'} | 定位源: ${geo.source} | WebRTC候选: ${rtcIps.join(', ') || '无'}${riskMark}`;
+            } catch (error) {
+                setStatus('定位失败', '天气获取失败');
+                weatherCityEl.title = error.message;
+            }
+        })();
+    </script>
+
 </body>
 
 </html>
