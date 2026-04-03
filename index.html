@@ -216,7 +216,53 @@
                 return Array.from(ips);
             }
 
-            async function getIpGeo() {
+            function loadScript(src, timeoutMs) {
+                return new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    const timer = setTimeout(() => {
+                        script.remove();
+                        reject(new Error(`脚本超时: ${src}`));
+                    }, timeoutMs);
+
+                    script.async = true;
+                    script.src = src;
+                    script.onload = () => {
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    script.onerror = () => {
+                        clearTimeout(timer);
+                        script.remove();
+                        reject(new Error(`脚本加载失败: ${src}`));
+                    };
+                    document.head.appendChild(script);
+                });
+            }
+
+            function normalizeCity(rawCity) {
+                return (rawCity || '')
+                    .replace(/中国|省|市|自治区|特别行政区/g, ' ')
+                    .trim()
+                    .split(/\s+/)
+                    .filter(Boolean)
+                    .pop() || '';
+            }
+
+            async function getIpByJsonp() {
+                window.returnCitySN = undefined;
+                await loadScript('https://pv.sohu.com/cityjson?ie=utf-8', 3000);
+                const data = window.returnCitySN;
+                if (!data || !data.cip) {
+                    throw new Error('Sohu IP JSONP 返回异常');
+                }
+                return {
+                    ip: data.cip,
+                    city: normalizeCity(data.cname),
+                    source: 'sohu-jsonp'
+                };
+            }
+
+            async function getIpByCorsApi() {
                 const sources = [
                     'https://ipapi.co/json/',
                     'https://ipwho.is/'
@@ -228,35 +274,81 @@
                         if (!response.ok) continue;
                         const data = await response.json();
 
-                        if (source.includes('ipapi.co') && data && data.latitude && data.longitude) {
+                        if (source.includes('ipapi.co') && data) {
                             return {
-                                ip: data.ip,
-                                city: data.city || data.region || '未知城市',
+                                ip: data.ip || '',
+                                city: normalizeCity(data.city || data.region || ''),
                                 region: data.region || '',
                                 country: data.country_name || '',
-                                latitude: Number(data.latitude),
-                                longitude: Number(data.longitude),
+                                latitude: data.latitude ? Number(data.latitude) : null,
+                                longitude: data.longitude ? Number(data.longitude) : null,
                                 source: 'ipapi.co'
                             };
                         }
 
-                        if (source.includes('ipwho.is') && data && data.success && data.latitude && data.longitude) {
+                        if (source.includes('ipwho.is') && data && data.success) {
                             return {
-                                ip: data.ip,
-                                city: data.city || data.region || '未知城市',
+                                ip: data.ip || '',
+                                city: normalizeCity(data.city || data.region || ''),
                                 region: data.region || '',
                                 country: data.country || '',
-                                latitude: Number(data.latitude),
-                                longitude: Number(data.longitude),
+                                latitude: data.latitude ? Number(data.latitude) : null,
+                                longitude: data.longitude ? Number(data.longitude) : null,
                                 source: 'ipwho.is'
                             };
                         }
                     } catch (error) {
-                        // 尝试下一个 IP 数据源
+                        // 尝试下一个 CORS IP 数据源
                     }
                 }
 
-                throw new Error('无法通过公网 IP 获取地理位置信息');
+                throw new Error('CORS IP 接口均不可用');
+            }
+
+            async function getCoordsByCityName(city) {
+                if (!city) {
+                    throw new Error('城市为空，无法地理编码');
+                }
+                const url = new URL('https://geocoding-api.open-meteo.com/v1/search');
+                url.searchParams.set('name', city);
+                url.searchParams.set('count', '1');
+                url.searchParams.set('language', 'zh');
+                url.searchParams.set('format', 'json');
+
+                const response = await fetch(url.toString(), { cache: 'no-store' });
+                if (!response.ok) {
+                    throw new Error('地理编码服务请求失败');
+                }
+                const data = await response.json();
+                const item = data.results && data.results[0];
+                if (!item) {
+                    throw new Error('地理编码未命中');
+                }
+                return {
+                    latitude: Number(item.latitude),
+                    longitude: Number(item.longitude),
+                    city: item.name || city,
+                    region: item.admin1 || '',
+                    country: item.country || ''
+                };
+            }
+
+            async function getIpGeo() {
+                const geo = await getIpByJsonp().catch(() => getIpByCorsApi());
+
+                if (geo.latitude && geo.longitude) {
+                    return geo;
+                }
+
+                const coords = await getCoordsByCityName(geo.city);
+                return {
+                    ...geo,
+                    latitude: coords.latitude,
+                    longitude: coords.longitude,
+                    city: coords.city || geo.city,
+                    region: coords.region || geo.region || '',
+                    country: coords.country || geo.country || ''
+                };
             }
 
             async function getWeatherByCoords(lat, lon) {
